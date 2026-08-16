@@ -13,7 +13,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contractimpl, contracttype, contractevent, symbol_short,
-    Address, Env, Symbol, Vec,
+    Address, BytesN, Env, Symbol, Vec,
 };
 
 // ── Constants ────────────────────────────────────────────────────
@@ -21,12 +21,17 @@ const MAX_AGE_SECS:       u64  = 300;    // 5 minutes
 const TWAP_WINDOW_SECS:   u64  = 3_600;  // 1 hour default
 const MAX_PROVIDERS:      u32  = 21;     // odd for clean median
 const MIN_PROVIDERS:      u32  = 3;      // minimum to accept price
+const MAX_BATCH:          u32  = 32;     // max assets per submit_prices
 const CIRCUIT_BPS:        i128 = 2_000;  // 20% max move per update
 const PRECISION:          i128 = 10_000;
 const ADMIN:              Symbol = symbol_short!("ADMIN");
 const DAO:                Symbol = symbol_short!("DAO");
 const PROVIDER_COUNT:     Symbol = symbol_short!("PCNT");
 const TWAP_WINDOW:        Symbol = symbol_short!("TWINDOW");
+/// DAO-adjustable minimum number of observations required before a price
+/// aggregation is accepted (defaults to `MIN_PROVIDERS` until the DAO calls
+/// `set_min_providers`).
+const MIN_PROVIDERS_KEY:  Symbol = symbol_short!("MINPROV");
 
 // ── Types ─────────────────────────────────────────────────────────
 #[contracttype]
@@ -150,47 +155,54 @@ impl OracleTwap {
         }.publish(&env);
     }
 
+    /// Adjust the minimum number of price observations required before an
+    /// aggregation is accepted (quorum for the oracle to trust a price).
+    /// Must stay within [1, MAX_PROVIDERS] and can never exceed the current
+    /// provider count, otherwise the oracle would be unable to ever
+    /// aggregate a price. DAO-governed (see `_require_dao`).
+    pub fn set_min_providers(env: Env, dao: Address, min_providers: u32) {
+        Self::_require_dao(&env, &dao);
+        assert!(min_providers >= 1, "min providers must be at least 1");
+        assert!(min_providers <= MAX_PROVIDERS, "min providers exceeds max providers");
+        let count: u32 = env.storage().instance().get(&PROVIDER_COUNT).unwrap_or(0);
+        assert!(min_providers <= count, "min providers exceeds current provider count");
+        env.storage().instance().set(&MIN_PROVIDERS_KEY, &min_providers);
+    }
+
+    pub fn get_min_providers(env: Env) -> u32 {
+        env.storage().instance().get(&MIN_PROVIDERS_KEY).unwrap_or(MIN_PROVIDERS)
+    }
+
+    /// Replace this contract's Wasm in place. Instance and persistent
+    /// storage are preserved. Authorised by the stored DAO address.
+    pub fn upgrade(env: Env, _dao: Address, new_wasm_hash: BytesN<32>) {
+        let stored: Address = env.storage().instance().get(&DAO).unwrap();
+        stored.require_auth();
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+    }
+
     // ── Submit price observation ──────────────────────────────────
     pub fn submit_price(env: Env, provider: Address, asset: Symbol, price: i128) {
-        provider.require_auth();
-        assert!(
-            env.storage().persistent().has(&DataKey::Provider(provider.clone())),
-            "not an authorised provider"
-        );
-        assert!(price > 0, "price must be positive");
+        Self::_require_provider(&env, &provider);
+        Self::_submit_one(&env, &provider, asset, price);
+    }
 
-        let now = env.ledger().timestamp();
-
-        // Circuit breaker: reject > 20% move from last accepted price
-        let feed_opt: Option<AssetFeed> = env.storage().persistent()
-            .get(&DataKey::Feed(asset.clone()));
-        if let Some(ref feed) = feed_opt {
-            if feed.latest_price > 0 {
-                let delta = (price - feed.latest_price).abs();
-                let max_delta = feed.latest_price * CIRCUIT_BPS / PRECISION;
-                assert!(delta <= max_delta, "price move exceeds circuit breaker");
-            }
-        }
-
-        // Store observation
-        let obs = PriceObservation { price, timestamp: now, provider: provider.clone() };
-        // Append to pending observations for this asset
-        let mut pending: Vec<PriceObservation> = env.storage().persistent()
-            .get(&DataKey::PendingObservations(asset.clone()))
-            .unwrap_or(Vec::new(&env));
-        pending.push_back(obs);
-        env.storage().persistent().set(&DataKey::PendingObservations(asset.clone()), &pending);
-
-        PriceEvent {
-            asset: asset.clone(),
-            provider: provider.clone(),
-            price,
-        }.publish(&env);
-
-        // Auto-aggregate when enough observations collected
-        let count: u32 = env.storage().instance().get(&PROVIDER_COUNT).unwrap_or(0);
-        if pending.len() >= count.min(MAX_PROVIDERS) / 3 + 1 {
-            Self::_aggregate(&env, asset);
+    /// Push many asset prices in a single invoke (one inclusion fee, one
+    /// `require_auth`). Each tick still runs the circuit breaker and may
+    /// auto-aggregate independently.
+    pub fn submit_prices(
+        env: Env,
+        provider: Address,
+        assets: Vec<Symbol>,
+        prices: Vec<i128>,
+    ) {
+        Self::_require_provider(&env, &provider);
+        let n = assets.len();
+        assert!(n > 0, "empty batch");
+        assert!(n == prices.len(), "assets/prices length mismatch");
+        assert!(n <= MAX_BATCH, "batch exceeds max");
+        for i in 0..n {
+            Self::_submit_one(&env, &provider, assets.get(i).unwrap(), prices.get(i).unwrap());
         }
     }
 
@@ -299,8 +311,10 @@ impl OracleTwap {
             .get(&DataKey::PendingObservations(asset.clone()))
             .unwrap_or(Vec::new(env));
 
+        let min_providers: u32 = env.storage().instance()
+            .get(&MIN_PROVIDERS_KEY).unwrap_or(MIN_PROVIDERS);
         let n = pending.len() as usize;
-        assert!(n >= MIN_PROVIDERS as usize, "insufficient observations");
+        assert!(n >= min_providers as usize, "insufficient observations");
 
         // Collect prices into a fixed-size array and sort (insertion sort, no_std)
         let mut prices: Vec<i128> = Vec::new(env);
@@ -360,4 +374,55 @@ impl OracleTwap {
         assert!(*caller == dao, "DAO only");
         caller.require_auth();
     }
+
+    fn _require_provider(env: &Env, provider: &Address) {
+        provider.require_auth();
+        assert!(
+            env.storage().persistent().has(&DataKey::Provider(provider.clone())),
+            "not an authorised provider"
+        );
+    }
+
+    fn _submit_one(env: &Env, provider: &Address, asset: Symbol, price: i128) {
+        assert!(price > 0, "price must be positive");
+
+        let now = env.ledger().timestamp();
+
+        // Circuit breaker: reject > 20% move from last accepted price
+        let feed_opt: Option<AssetFeed> = env.storage().persistent()
+            .get(&DataKey::Feed(asset.clone()));
+        if let Some(ref feed) = feed_opt {
+            if feed.latest_price > 0 {
+                let delta = (price - feed.latest_price).abs();
+                let max_delta = feed.latest_price * CIRCUIT_BPS / PRECISION;
+                assert!(delta <= max_delta, "price move exceeds circuit breaker");
+            }
+        }
+
+        let obs = PriceObservation { price, timestamp: now, provider: provider.clone() };
+        let mut pending: Vec<PriceObservation> = env.storage().persistent()
+            .get(&DataKey::PendingObservations(asset.clone()))
+            .unwrap_or(Vec::new(env));
+        pending.push_back(obs);
+        env.storage().persistent().set(&DataKey::PendingObservations(asset.clone()), &pending);
+
+        PriceEvent {
+            asset: asset.clone(),
+            provider: provider.clone(),
+            price,
+        }.publish(env);
+
+        // Auto-aggregate once the DAO-configured quorum is met. Using
+        // `count/3+1` here used to fire _aggregate with too few observations,
+        // which then panicked (`insufficient observations`) and trapped the
+        // whole submit_price call as UnreachableCodeReached.
+        let min_providers: u32 = env.storage().instance()
+            .get(&MIN_PROVIDERS_KEY).unwrap_or(MIN_PROVIDERS);
+        if pending.len() >= min_providers {
+            Self::_aggregate(env, asset);
+        }
+    }
 }
+
+#[cfg(test)]
+mod test;

@@ -4,7 +4,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contractimpl, contracttype, contractevent, contractmeta,
-    symbol_short, Address, Env, String, Symbol,
+    symbol_short, Address, BytesN, Env, String, Symbol,
 };
 
 // SEP-41 required metadata
@@ -256,6 +256,14 @@ impl SyntheticToken {
     pub fn set_minter(env: Env, admin: Address, minter: Address) {
         Self::_require_admin(&env, &admin);
         env.storage().instance().set(&MINTER, &minter);
+    }
+
+    /// Replace this contract's Wasm in place. Instance and persistent
+    /// storage are preserved. Authorised by the stored admin.
+    pub fn upgrade(env: Env, _admin: Address, new_wasm_hash: BytesN<32>) {
+        let admin: Address = env.storage().instance().get(&ADMIN).unwrap();
+        admin.require_auth();
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
     }
 
     // ════════════════════════════════════════════════════════════
